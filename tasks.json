@@ -1,0 +1,31 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build CDP Bridge",
+            "type": "shell",
+            "command": "cl.exe",
+            "args": [
+                "/Zi",
+                "/EHsc",
+                "/nologo",
+                "/I", "C:\\vcpkg\\installed\\x64-windows\\include",
+                "${file}",
+                "/link",
+                "/LIBPATH:C:\\vcpkg\\installed\\x64-windows\\lib",
+                "ixwebsocket.lib",
+                "ssleay32.lib",
+                "libeay32.lib",
+                "crypt32.lib",
+                "ws2_32.lib",
+                "iphlpapi.lib",
+                "shlwapi.lib",
+                "/out:${fileDirname}\\${fileBasenameNoExtension}.exe"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        }
+    ]
+}
