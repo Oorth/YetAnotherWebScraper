@@ -48,31 +48,6 @@ struct _SKINS
 
 using json = nlohmann::json;
 
-float ParseCleanFloat(std::string raw)
-{
-    if (raw == "N/A" || raw.empty()) return 0.0f;
-
-    // Remove anything that is NOT a digit or a dot
-    // This strips '$', ',', '%', and spaces
-    std::string clean = "";
-    for(char c : raw)
-    {
-        if(isdigit(c) || c == '.')
-        {
-            clean += c;
-        }
-    }
-    
-    try
-    {
-        return std::stof(clean);
-    }
-    catch (...)
-    {
-        return 0.0f;
-    }
-}
-
 bool launch_chrome(std::string chromePath, std::string proxy = "")
 {
     STARTUPINFOA si;
@@ -428,6 +403,92 @@ json inject_extractionJs()
 
 }
 
+bool ScrapeSkin(_SKINS& skin)
+{
+    // ---------------------------------------------------------
+    // Construct URL & Navigate
+    // ---------------------------------------------------------
+    std::string url = "https://csgoskins.gg/items/" + skin.name + "/" + skin.condition_string;
+    
+    std::cout << "\n------------------------------------------------" << std::endl;
+    std::cout << "[+] Processing: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
+    std::cout << "[+] Navigating: " << url << std::endl;
+
+    Core::SendCommand("Page.navigate", { {"url", url} });
+
+    // ---------------------------------------------------------
+    // Wait for Load
+    // ---------------------------------------------------------
+
+    if(!Core::WaitForSelector(".active-offer", 8000))
+    {
+        std::cerr << "[-] Timeout: Offers not found for " << skin.name << std::endl;
+        return false;
+    }
+
+    Sleep(200);
+
+    // ---------------------------------------------------------
+    // Extract Data
+    // ---------------------------------------------------------
+    json response = inject_extractionJs();
+
+    // Helper Lambda for Float Parsing
+    auto ParseCleanFloat = [](std::string raw) -> float {
+        if (raw == "N/A" || raw.empty()) return 0.0f;
+        std::string clean = "";
+        for (char c : raw) {
+            if (isdigit(c) || c == '.') clean += c;
+        }
+        try { return std::stof(clean); } catch (...) { return 0.0f; }
+    };
+
+    // ---------------------------------------------------------
+    // Parse JSON
+    // ---------------------------------------------------------
+    if( !response.contains("result") || !response["result"].contains("result") || !response["result"]["result"].contains("value") )
+    {
+        std::cerr << "[-] Error: Invalid JSON response." << std::endl;
+        return false;
+    }
+
+    auto resultObj = response["result"]["result"]["value"];
+
+    if(resultObj["status"] == "error") 
+    {
+        std::cerr << "[-] JS Error: " << resultObj["message"] << std::endl;
+        return false;
+    }
+
+    // Global Stats
+    if(resultObj.contains("stats"))
+    {
+        skin.market_info.volume_24h = ParseCleanFloat(resultObj["stats"]["volume"].get<std::string>());
+        skin.market_info.vol_by_cap = ParseCleanFloat(resultObj["stats"]["vol_cap"].get<std::string>());
+    }
+
+    // Offers
+    if(resultObj.contains("offers"))
+    {
+        skin.market_info.market_offers.clear();
+        
+        for(const auto& item : resultObj["offers"])
+        {
+            _MARKET_OFFERS tempOffer;
+            
+            tempOffer.marketName = item["market"].get<std::string>();
+            tempOffer.marketLink = item["link"].get<std::string>();
+            tempOffer.numOffers  = (int)ParseCleanFloat(item["count"].get<std::string>());
+            tempOffer.minPrice   = ParseCleanFloat(item["price"].get<std::string>());
+
+            skin.market_info.market_offers.push_back(tempOffer);
+        }
+    }
+
+    std::cout << "[+] Success: Scraped " << skin.market_info.market_offers.size() << " offers." << std::endl;
+    return true;
+}
+
 void print(const _SKINS& skin)
 {
     std::cout << "\n========================================" << std::endl;
@@ -454,15 +515,14 @@ void print(const _SKINS& skin)
 
 int main()
 {
+
+    #pragma region Initialize
+
     // Initialize Networking
     ix::initNetSystem();
 
     std::cout << "[+] Launching Browser..." << std::endl;
     std::string path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-
-    // TOR CONFIGURATION
-    // Tor Browser uses port 9150 by default.
-    // Tor Expert Bundle uses port 9050.
     std::string torProxy = "socks5://127.0.0.1:9150";
 
     if(!launch_chrome(path, torProxy))
@@ -487,7 +547,12 @@ int main()
     // Connect the Bridge
     Core::ConnectToBrowser(wsUrl);
 
+    #pragma endregion
+
     // ----------------------------------------------------------------------------------------------------------------
+    
+    #pragma region Verify_tor_proxy
+    
     std::cout << "[+] Checking IP Address via Tor..." << std::endl;
     
     Core::SendCommand("Page.navigate", { {"url", "https://api.ipify.org/"} });
@@ -507,87 +572,40 @@ int main()
         else std::cerr << "[-] Error: Failed to extract IP string." << std::endl;
     }
     else std::cerr << "[-] Timeout: Tor network is too slow or connection died." << std::endl;
+
+    #pragma endregion
+
     // ----------------------------------------------------------------------------------------------------------------
 
-    _SKINS awp_fn, usps_fn;
+    std::vector<_SKINS> targets;
 
-    awp_fn.condition_string = "factory-new";
-    awp_fn.name = "awp-printstream";
+    _SKINS item1;
+    item1.name = "awp-printstream";
+    item1.condition_string = "factory-new";
+    targets.push_back(item1);
 
-    awp_fn.condition_string = "factory-new";
-    awp_fn.name = "usp-s-printstream";
+    _SKINS item2;
+    item2.name = "usp-s-printstream";
+    item2.condition_string = "factory-new";
+    targets.push_back(item2);
 
-    std::cout << "[+] Navigating to Aggregator..." << std::endl;
-    Core::SendCommand("Page.navigate", { {"url", "https://csgoskins.gg/items/" + awp_fn.name + "/" + awp_fn.condition_string} });
+    _SKINS item3;
+    item3.name = "ak-47-vulcan";
+    item3.condition_string = "field-tested";
+    targets.push_back(item3);
 
-    std::cout << "[+] Waiting for 'active-offer' elements..." << std::endl;
     
-    // We wait for the specific class that holds the data we want
-    if(!Core::WaitForSelector(".active-offer", 5000))
+    std::cout << "\n[+] Starting Batch Scraping of " << targets.size() << " items..." << std::endl;
+    for(auto& skin : targets)
     {
-        ix::uninitNetSystem();   
-        std::cerr << "[-] Timed out. Page took too long to load." << std::endl;
-        return 0;
-    }
 
-    std::cout << "[+] Allowing data to hydrate (200ms)..." << std::endl;
-    Sleep(200); 
+        if(ScrapeSkin(skin)) print(skin);
+        else std::cerr << "[-] Failed to scrape " << skin.name << std::endl;
 
-    json response = inject_extractionJs();
-
-    // -------------------------------------------------------------------------
-    // PROCESS RESULTS
-    // -------------------------------------------------------------------------
-    
-    if( !response.contains("result") || !response["result"].contains("result") || !response["result"]["result"].contains("value") )
-    {
-        std::cerr << "[-] Critical: Failed to receive valid JSON." << std::endl;
-        ix::uninitNetSystem();
-        return 0;
-    }
-
-    auto resultObj = response["result"]["result"]["value"];
-
-    if(resultObj["status"] == "error") 
-    {
-        std::cerr << "[-] JS CRASHED: " << resultObj["message"] << std::endl;
-        ix::uninitNetSystem();
-        return 0;
+        std::cout << "[...] Waiting 1 seconds..." << std::endl;
+        Sleep(1000); 
     }
     
-    std::string rawVol = resultObj["stats"]["volume"].get<std::string>();
-    std::string rawCap = resultObj["stats"]["vol_cap"].get<std::string>();
-
-    awp_fn.market_info.volume_24h = ParseCleanFloat(rawVol);
-    awp_fn.market_info.vol_by_cap = ParseCleanFloat(rawCap);
-
-    // Parse Offers List
-    auto items = resultObj["offers"];
-    
-    // Clear vector to avoid duplicates if running in a loop
-    awp_fn.market_info.market_offers.clear();
-
-    for(const auto& item : items)
-    {
-        _MARKET_OFFERS tempOffer;
-
-        tempOffer.marketName = item["market"].get<std::string>();
-        tempOffer.marketLink = item["link"].get<std::string>();
-
-        std::string rawCount = item["count"].get<std::string>();
-        std::string rawPrice = item["price"].get<std::string>();
-
-        tempOffer.numOffers = (int)ParseCleanFloat(rawCount);
-        tempOffer.minPrice  = ParseCleanFloat(rawPrice);
-
-        awp_fn.market_info.market_offers.push_back(tempOffer);
-    }
-    
-    std::cout << "[+] Successfully parsed " << awp_fn.market_info.market_offers.size() << " offers." << std::endl;
-    
-    print(awp_fn);
-
-
 
     ix::uninitNetSystem();
     return 0;
