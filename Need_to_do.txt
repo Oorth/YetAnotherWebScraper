@@ -1,0 +1,3 @@
+1) Store the fetched Data 
+1) Implement the Search Interaction logic to make the tool work for any skin without manual URL editing.
+2) Implement CSV/JSON Persistence to save these results to a file for long-term price tracking.

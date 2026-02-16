@@ -7,14 +7,73 @@
 #include <map>
 #include <mutex>
 #include <iomanip>
+#include <algorithm>
 #include <ixwebsocket/IXHttpClient.h>
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 
+
+// -------------------------------------------------------------------------------------------------
+
+struct _MARKET_OFFERS
+{
+    std::string marketName;
+    int numOffers;
+    float minPrice;
+
+    std::string marketLink;
+};
+
+struct _MARKET_INFO
+{
+    float volume_24h;
+    float vol_by_cap;
+
+    std::vector<_MARKET_OFFERS> market_offers;
+};
+
+struct _SKINS
+{
+    int id;
+    std::string name;
+    
+    std::string condition_string;
+    float condition_float;
+
+    _MARKET_INFO market_info;
+};
+
+// -------------------------------------------------------------------------------------------------
+
 using json = nlohmann::json;
 
-bool launch_chrome(std::string chromePath)
+float ParseCleanFloat(std::string raw)
+{
+    if (raw == "N/A" || raw.empty()) return 0.0f;
+
+    // Remove anything that is NOT a digit or a dot
+    // This strips '$', ',', '%', and spaces
+    std::string clean = "";
+    for(char c : raw)
+    {
+        if(isdigit(c) || c == '.')
+        {
+            clean += c;
+        }
+    }
+    
+    try
+    {
+        return std::stof(clean);
+    }
+    catch (...)
+    {
+        return 0.0f;
+    }
+}
+
+bool launch_chrome(std::string chromePath, std::string proxy = "")
 {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -35,6 +94,18 @@ bool launch_chrome(std::string chromePath)
                         "--no-default-browser-check " +
                         "--user-data-dir=\"C:\\temp\\cs_research_profile\"";
 
+    
+    // --- PROXY LOGIC ---
+    if(!proxy.empty())
+    {
+        // Standard Chrome flag for proxies
+        cmd += " --proxy-server=\"" + proxy + "\"";
+        std::cout << "[+] Launching with Proxy: " << proxy << std::endl;
+    }
+    else std::cout << "[+] Launching without Proxy (Direct)" << std::endl;
+    // -------------------
+    
+    
     BOOL success = CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
     if(!success)
     {
@@ -357,6 +428,30 @@ json inject_extractionJs()
 
 }
 
+void print(const _SKINS& skin)
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << " ITEM: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
+    std::cout << "========================================" << std::endl;
+    
+    // Print Global Stats with 2 decimal precision
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << " 24h Volume  : $" << skin.market_info.volume_24h << std::endl;
+    std::cout << " Vol / Cap   : "  << (skin.market_info.vol_by_cap * 100.0f) << "%" << std::endl; // Assuming this is a percentage ratio
+    std::cout << "========================================\n" << std::endl;
+
+    std::cout << "--- FOUND " << skin.market_info.market_offers.size() << " OFFERS ---\n";
+
+    for(const _MARKET_OFFERS& offer : skin.market_info.market_offers)
+    {
+        std::cout << "Market: " << std::left << std::setw(15) << offer.marketName
+                  << "| Offers: " << std::left << std::setw(5) << offer.numOffers
+                  << "| Price: $" << std::left << std::setw(10) << offer.minPrice
+                  << "| Link: " << offer.marketLink << std::endl;
+    }
+    std::cout << std::endl;
+}
+
 int main()
 {
     // Initialize Networking
@@ -364,7 +459,13 @@ int main()
 
     std::cout << "[+] Launching Browser..." << std::endl;
     std::string path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-    if(!launch_chrome(path))
+
+    // TOR CONFIGURATION
+    // Tor Browser uses port 9150 by default.
+    // Tor Expert Bundle uses port 9050.
+    std::string torProxy = "socks5://127.0.0.1:9150";
+
+    if(!launch_chrome(path, torProxy))
     {
         ix::uninitNetSystem();
         std::cerr << "[-] Failed to launch Chrome." << std::endl;
@@ -387,11 +488,37 @@ int main()
     Core::ConnectToBrowser(wsUrl);
 
     // ----------------------------------------------------------------------------------------------------------------
+    std::cout << "[+] Checking IP Address via Tor..." << std::endl;
+    
+    Core::SendCommand("Page.navigate", { {"url", "https://api.ipify.org/"} });
 
+    if(Core::WaitForSelector("pre", 30000))
+    {
+        json ipCheck = Core::SendCommand("Runtime.evaluate", { 
+            {"expression", "document.body.innerText"}, 
+            {"returnByValue", true} 
+        });
+
+        if(ipCheck.contains("result") && ipCheck["result"].contains("result") && ipCheck["result"]["result"].contains("value"))
+        {
+            std::string ip = ipCheck["result"]["result"]["value"];
+            std::cout << "[*] Current IP: " << ip << std::endl;
+        }
+        else std::cerr << "[-] Error: Failed to extract IP string." << std::endl;
+    }
+    else std::cerr << "[-] Timeout: Tor network is too slow or connection died." << std::endl;
+    // ----------------------------------------------------------------------------------------------------------------
+
+    _SKINS awp_fn, usps_fn;
+
+    awp_fn.condition_string = "factory-new";
+    awp_fn.name = "awp-printstream";
+
+    awp_fn.condition_string = "factory-new";
+    awp_fn.name = "usp-s-printstream";
 
     std::cout << "[+] Navigating to Aggregator..." << std::endl;
-    Core::SendCommand("Page.navigate", { {"url", "https://csgoskins.gg/items/awp-printstream/factory-new"} });
-
+    Core::SendCommand("Page.navigate", { {"url", "https://csgoskins.gg/items/" + awp_fn.name + "/" + awp_fn.condition_string} });
 
     std::cout << "[+] Waiting for 'active-offer' elements..." << std::endl;
     
@@ -412,43 +539,55 @@ int main()
     // PROCESS RESULTS
     // -------------------------------------------------------------------------
     
-    if(response.contains("result") && response["result"].contains("result") && response["result"]["result"].contains("value"))
-    {
-        auto resultObj = response["result"]["result"]["value"];
-
-        if(resultObj["status"] == "error")
-        {
-            std::cerr << "[-] JS CRASHED: " << resultObj["message"] << std::endl;
-        }
-        else
-        {
-            // 1. Print the Global Stats
-            if(resultObj.contains("stats")) {
-                std::cout << "\n========================================" << std::endl;
-                std::cout << " ITEM STATISTICS " << std::endl;
-                std::cout << "========================================" << std::endl;
-                std::cout << " 24h Volume  : " << resultObj["stats"]["volume"].get<std::string>() << std::endl;
-                std::cout << " Vol / Cap   : " << resultObj["stats"]["vol_cap"].get<std::string>() << std::endl;
-                std::cout << "========================================\n" << std::endl;
-            }
-
-            // 2. Print the Offers
-            auto items = resultObj["offers"];
-            std::cout << "--- FOUND " << items.size() << " OFFERS ---\n";
-
-            for(const auto& item : items)
-            {
-                std::cout << "Market: " << std::left << std::setw(15) << item["market"].get<std::string>()
-                          << "| Offers: " << std::left << std::setw(5) << item["count"].get<std::string>()
-                          << "| Price: " << std::left << std::setw(10) << item["price"].get<std::string>()
-                          << "| Link: " << item["link"].get<std::string>() << std::endl;
-            }
-        }
-    }
-    else 
+    if( !response.contains("result") || !response["result"].contains("result") || !response["result"]["result"].contains("value") )
     {
         std::cerr << "[-] Critical: Failed to receive valid JSON." << std::endl;
+        ix::uninitNetSystem();
+        return 0;
     }
+
+    auto resultObj = response["result"]["result"]["value"];
+
+    if(resultObj["status"] == "error") 
+    {
+        std::cerr << "[-] JS CRASHED: " << resultObj["message"] << std::endl;
+        ix::uninitNetSystem();
+        return 0;
+    }
+    
+    std::string rawVol = resultObj["stats"]["volume"].get<std::string>();
+    std::string rawCap = resultObj["stats"]["vol_cap"].get<std::string>();
+
+    awp_fn.market_info.volume_24h = ParseCleanFloat(rawVol);
+    awp_fn.market_info.vol_by_cap = ParseCleanFloat(rawCap);
+
+    // Parse Offers List
+    auto items = resultObj["offers"];
+    
+    // Clear vector to avoid duplicates if running in a loop
+    awp_fn.market_info.market_offers.clear();
+
+    for(const auto& item : items)
+    {
+        _MARKET_OFFERS tempOffer;
+
+        tempOffer.marketName = item["market"].get<std::string>();
+        tempOffer.marketLink = item["link"].get<std::string>();
+
+        std::string rawCount = item["count"].get<std::string>();
+        std::string rawPrice = item["price"].get<std::string>();
+
+        tempOffer.numOffers = (int)ParseCleanFloat(rawCount);
+        tempOffer.minPrice  = ParseCleanFloat(rawPrice);
+
+        awp_fn.market_info.market_offers.push_back(tempOffer);
+    }
+    
+    std::cout << "[+] Successfully parsed " << awp_fn.market_info.market_offers.size() << " offers." << std::endl;
+    
+    print(awp_fn);
+
+
 
     ix::uninitNetSystem();
     return 0;
