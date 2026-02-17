@@ -1,18 +1,21 @@
-//cl.exe /MD /EHsc /I"C:\vcpkg\installed\x64-windows\include" YetAnotherScraper.cpp /link /LIBPATH:"C:\vcpkg\installed\x64-windows\lib" ixwebsocket.lib mbedtls.lib mbedx509.lib mbedcrypto.lib bcrypt.lib ws2_32.lib crypt32.lib gdi32.lib user32.lib advapi32.lib zlib.lib
+//cl.exe /MD /std:c++17 /EHsc /I"C:\vcpkg\installed\x64-windows\include" YetAnotherScraper.cpp /link /LIBPATH:"C:\vcpkg\installed\x64-windows\lib" ixwebsocket.lib mbedtls.lib mbedx509.lib mbedcrypto.lib bcrypt.lib ws2_32.lib crypt32.lib gdi32.lib user32.lib advapi32.lib zlib.lib
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <iostream>
 #include <string>
 #include <future>
-#include <map>
+#include <filesystem>
 #include <mutex>
+#include <thread>
 #include <iomanip>
-#include <algorithm>
 #include <ixwebsocket/IXHttpClient.h>
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 
+// -------------------------------------------------------------------------------------------------
+
+std::mutex printMutex;
 
 // -------------------------------------------------------------------------------------------------
 
@@ -48,245 +51,206 @@ struct _SKINS
 
 using json = nlohmann::json;
 
-bool launch_chrome(std::string chromePath, std::string proxy = "")
+PROCESS_INFORMATION LaunchInstance(int port, std::string proxy, std::string userDataDir)
 {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
-
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
-    // Critical flags for research and stealth
-    // --remote-debugging-port: Opens the CDP bridge
-    // --disable-blink-features=AutomationControlled: Removes 'navigator.webdriver'
-    // --user-data-dir: Persists cookies/sessions
+    std::string chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    
+    // Construct command line
     std::string cmd = "\"" + chromePath + "\" " +
-                        "--remote-debugging-port=9222 " +
-                        "--remote-allow-origins=* " + 
-                        "--disable-blink-features=AutomationControlled " +
-                        "--no-first-run " +
-                        "--no-default-browser-check " +
-                        "--user-data-dir=\"C:\\temp\\cs_research_profile\"";
+                      "--remote-debugging-port=" + std::to_string(port) + " " +
+                      "--user-data-dir=\"" + userDataDir + "\" " +
+                      "--remote-allow-origins=* " + 
+                      "--disable-blink-features=AutomationControlled " +
+                      "--no-first-run ";
+                    //   "--headless=new "; // OPTIONAL: Run headless so you don't see 10 windows popping up
 
-    
-    // --- PROXY LOGIC ---
-    if(!proxy.empty())
+    if(!proxy.empty()) cmd += " --proxy-server=\"" + proxy + "\"";
+
+    if(!CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
     {
-        // Standard Chrome flag for proxies
-        cmd += " --proxy-server=\"" + proxy + "\"";
-        std::cout << "[+] Launching with Proxy: " << proxy << std::endl;
-    }
-    else std::cout << "[+] Launching without Proxy (Direct)" << std::endl;
-    // -------------------
-    
-    
-    BOOL success = CreateProcessA(NULL, (LPSTR)cmd.c_str(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
-    if(!success)
-    {
-        DWORD error = GetLastError();
-        std::cout << "Error opening the process -> :" << error << std::endl;
-        return 0;
+        std::cerr << "[-] Failed to launch Chrome on port " << port << std::endl;
+        return {0};
     }
 
-    // Close handles to the process and thread to avoid memory leaks
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return true;
+    return pi;
 }
 
-std::string GetWebSocketUrl()
+std::string GetWebSocketUrl(int port)
 {
     ix::HttpClient httpClient;
     ix::HttpRequestArgsPtr args = httpClient.createRequest();
     
-    // IMPORTANT: Disable certificate validation just in case (though http shouldn't need it)
-    // and ensure no proxy interference.
-    args->connectTimeout = 5; 
+    args->connectTimeout = 3; 
     
-    int maxAttempts = 10;
+    std::string endpoint = "http://127.0.0.1:" + std::to_string(port) + "/json/list";
+    int maxAttempts = 5;
     
     for(int i = 0; i < maxAttempts; i++)
     {
-        // Query the JSON list endpoint
-        ix::HttpResponsePtr response = httpClient.get("http://127.0.0.1:9222/json/list", args);
+        ix::HttpResponsePtr response = httpClient.get(endpoint, args);
 
         if(response->statusCode == 200)
         {
             try
             {
                 auto targets = json::parse(response->body);
-                
                 for(auto& target : targets)
                 {
-                    // Chrome returns multiple targets (background pages, extensions, etc.)
-                    // We specifically want a "page" that has a WebSocket URL.
-                    if(target.contains("type") && target["type"] == "page" && target.contains("webSocketDebuggerUrl")) return target["webSocketDebuggerUrl"];
+                    // Filter for "page" type to avoid connecting to extensions/background workers
+                    if(target.contains("type") && target["type"] == "page" && target.contains("webSocketDebuggerUrl")) 
+                    {
+                        return target["webSocketDebuggerUrl"];
+                    }
                 }
             }
             catch(const json::exception& e)
             {
-                 std::cerr << "[-] JSON Parse Error: " << e.what() << std::endl;
+                // JSON might be incomplete if Chrome is still starting up
             }
         }
-        else std::cout << "[.] Connection attempt " << i + 1 << " failed. Status: " << response->statusCode << std::endl;
-
-        Sleep(1000);
+        
+        // Wait 500ms before retrying
+        Sleep(500);
     }
     
     return "";
 }
 
-namespace Core
+class ChromeClient
 {
-    // Global/Static state for the connection
+private:
     ix::WebSocket _ws;
-    std::mutex mapMutex;
+    std::mutex _queueMutex;
     std::map<int, std::promise<json>> _pendingRequests;
-    int currentId = 0;
+    int _currentId = 0;
+    bool _connected = false;
 
-    // This function handles incoming messages from Chrome
+    // Internal: Handles incoming messages from the WebSocket thread
     void OnMessage(const ix::WebSocketMessagePtr& msg)
     {
         if(msg->type == ix::WebSocketMessageType::Message)
         {
-            json response = json::parse(msg->str);
-            
-            // If the JSON has an 'id', it's a response to a command we sent
-            if(response.contains("id"))
-            {
-                int id = response["id"];
-                std::lock_guard<std::mutex> lock(mapMutex);
+            try {
+                json response = json::parse(msg->str);
                 
-                if(_pendingRequests.count(id))
+                // If the JSON has an 'id', it is a response to a command we sent
+                if(response.contains("id"))
                 {
-                    _pendingRequests[id].set_value(response);
-                    _pendingRequests.erase(id);
+                    int id = response["id"];
+                    std::lock_guard<std::mutex> lock(_queueMutex);
+                    
+                    // Check if we are waiting for this ID
+                    if(_pendingRequests.count(id))
+                    {
+                        _pendingRequests[id].set_value(response);
+                        _pendingRequests.erase(id);
+                    }
                 }
-            }
+            } catch(...) { /* Ignore malformed JSON */ }
         }
     }
 
-    // Connects the "Pipe" to the browser
-    void ConnectToBrowser(const std::string& url)
+public:
+    // Constructor
+    ChromeClient() {}
+
+    // Destructor: Clean shutdown
+    ~ChromeClient() {
+        if(_connected) _ws.stop();
+    }
+
+    bool Connect(const std::string& url)
     {
-        std::cout << "[.] Attempting WebSocket handshake..." << std::endl;
+        _ws.setUrl(url);
+        _ws.disableAutomaticReconnection(); // We handle lifecycle manually
 
-            // WORKAROUND: Since your library version lacks setProxy(), 
-            // we clear these environment variables to prevent auto-detection 
-            // of proxies like Fiddler/Charles for this process.
-            #ifdef _WIN32
-                _putenv("HTTP_PROXY=");
-                _putenv("HTTPS_PROXY=");
-                _putenv("ALL_PROXY=");
-            #else
-                unsetenv("HTTP_PROXY");
-                unsetenv("HTTPS_PROXY");
-                unsetenv("ALL_PROXY");
-            #endif
-
-            _ws.setUrl(url);
-            
-            ix::WebSocketHttpHeaders headers;
-            _ws.setExtraHeaders(headers);
-            
-            // REMOVED: _ws.setProxy("", 0); -> Your version does not support this.
-
-            _ws.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg)
-            {
-                if(msg->type == ix::WebSocketMessageType::Message)
-                {
-                    OnMessage(msg);
-                }
-                else if(msg->type == ix::WebSocketMessageType::Error)
-                {
-                    std::cerr << "\n[-] WebSocket Error: " << msg->errorInfo.reason << std::endl;
-                    std::cerr << "[-] HTTP Status: " << msg->errorInfo.http_status << std::endl;
-                }
-                else if(msg->type == ix::WebSocketMessageType::Close)
-                {
-                    std::cerr << "\n[-] Connection closed by Chrome." << std::endl;
-                }
-            });
-
+        // Important: Bind the callback to THIS instance
+        _ws.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
+            this->OnMessage(msg);
+        });
 
         _ws.start();
 
+        // Wait for connection (max 5 seconds)
         int timeout = 0;
         while(_ws.getReadyState() != ix::ReadyState::Open)
         {
-            if(timeout > 100) // 5 second timeout (100 * 50ms)
-            {
-                std::cerr << "\n[-] Connection timed out. ReadyState: " << (int)_ws.getReadyState() << std::endl;
-                return;
-            }
-
-            std::cout << "." << std::flush;
-            Sleep(50);
+            if(timeout > 50) return false; // 50 * 100ms = 5 sec
+            Sleep(100);
             timeout++;
         }
 
-        std::cout << "\n[+] WebSocket Bridge Open." << std::endl;
+        _connected = true;
+        return true;
     }
 
-    // Sends a command and WAITS for the result (Synchronous wrapper)
+    void Disconnect()
+    {
+        if(_connected) {
+            _ws.stop();
+            _connected = false;
+        }
+    }
+
+    // Thread-safe command sender
     json SendCommand(std::string method, json params = json::object())
     {
-        int id = ++currentId;
-        
-        json request = 
+        if(!_connected) return {{"error", "Not connected"}};
+
+        int id;
+        std::future<json> future;
+
+        // 1. Register the promise
         {
+            std::lock_guard<std::mutex> lock(_queueMutex);
+            id = ++_currentId;
+            // Create a promise and get its future
+            std::promise<json> p;
+            future = p.get_future();
+            _pendingRequests[id] = std::move(p);
+        }
+
+        // 2. Send the request
+        json request = {
             {"id", id},
             {"method", method},
             {"params", params}
         };
-
-        std::promise<json> promise;
-        std::future<json> future = promise.get_future();
-
-        {
-            std::lock_guard<std::mutex> lock(mapMutex);
-            _pendingRequests[id] = std::move(promise);
-        }
-
         _ws.send(request.dump());
 
-        // This blocks the C++ thread until Chrome sends the response back
+        // 3. Wait for the result (Blocking)
+        // You might want to add a timeout here (wait_for) in production code
+        if(future.wait_for(std::chrono::seconds(30)) == std::future_status::timeout)
+        {
+             return {{"error", "Timeout waiting for Chrome response"}};
+        }
+
         return future.get();
     }
 
-    // Helper: Blocks execution until the CSS selector exists on the page
+    // Instance-based Selector Waiter
     bool WaitForSelector(std::string selector, int timeoutMs = 10000)
     {
-        // A robust Polling-based waiter. 
-        // It survives page transitions better than MutationObserver.
         std::string jsCode = R"(
             (function(selector, timeout) {
                 return new Promise((resolve, reject) => {
                     const startTime = Date.now();
-
                     const check = () => {
-                        // 1. Found it?
-                        if(document.querySelector(selector)) {
-                            return resolve(true);
-                        }
-
-                        // 2. Timeout?
-                        if(Date.now() - startTime > timeout) {
-                            return reject(new Error("Timeout waiting for " + selector));
-                        }
-
-                        // 3. Keep looking (Check again in 100ms)
+                        if(document.querySelector(selector)) return resolve(true);
+                        if(Date.now() - startTime > timeout) return resolve(false); // Resolve false instead of reject
                         setTimeout(check, 100);
                     };
-
                     check();
                 });
             })
         )";
 
-        // Inject arguments
         std::string fullExpression = jsCode + "('" + selector + "', " + std::to_string(timeoutMs) + ")";
 
         json evalParams = {
@@ -295,30 +259,48 @@ namespace Core
             {"returnByValue", true}
         };
 
-        // Send command
-        json response = Core::SendCommand("Runtime.evaluate", evalParams);
+        json response = SendCommand("Runtime.evaluate", evalParams);
 
-        // --- DEBUGGING BLOCK ---
-        // If there is an error(Exception), print it!
-        if(response.contains("result") && response["result"].contains("exceptionDetails")) 
+        if(response.contains("result") && 
+           response["result"].contains("result") && 
+           response["result"]["result"].contains("value"))
         {
-            auto details = response["result"]["exceptionDetails"];
-            std::cerr << "\n[!] WaitForSelector Error: " << details["text"] << std::endl;
-            
-            if(details.contains("exception") && details["exception"].contains("description"))
-            {
-                std::cerr << "[!] Details: " << details["exception"]["description"] << std::endl;
-            }
-            return false;
+            return response["result"]["result"]["value"].get<bool>();
         }
-        // -----------------------
+        return false;
+    }
+};
 
-        return true;
+class ProxyManager
+{
+private:
+    std::vector<std::string> proxies;
+    int currentIndex = 0;
+
+public:
+    ProxyManager()
+    {
+        // Add your proxies here. 
+        // If you are using Tor, you might only have one, but let's pretend we have a list.
+        proxies.push_back("socks5://127.0.0.1:9150"); // Tor 1
+        // proxies.push_back("http://192.168.1.50:8080"); // Mobile 1
+        // proxies.push_back("http://10.0.0.1:3128");    // Data Center 1
     }
 
-}
+    std::string GetNextProxy()
+    {
+        if(proxies.empty()) return "";
+        
+        // Round Robin rotation
+        std::string p = proxies[currentIndex];
+        currentIndex = (currentIndex + 1) % proxies.size();
+        return p;
+    }
 
-json inject_extractionJs()
+
+};
+
+json inject_extractionJs(ChromeClient& client)
 {
 
     std::string extractionJs = R"(
@@ -392,35 +374,61 @@ json inject_extractionJs()
         })()
     )";
 
-    std::cout << "[+] Running Extraction Script..." << std::endl;
+    // std::cout << "[+] Running Extraction Script..." << std::endl;
     
     json evalParams = { 
         {"expression", extractionJs}, 
         {"returnByValue", true} 
     };
     
-    return Core::SendCommand("Runtime.evaluate", evalParams);
+    return client.SendCommand("Runtime.evaluate", evalParams);
 
 }
 
-bool ScrapeSkin(_SKINS& skin)
+void print(const _SKINS& skin, size_t no_of_markets)
+{
+    std::cout << "\n========================================" << std::endl;
+    std::cout << " ITEM: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
+    std::cout << "========================================" << std::endl;
+    
+    // Print Global Stats with 2 decimal precision
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << " 24h Volume  : $" << skin.market_info.volume_24h << std::endl;
+    std::cout << " Vol / Cap   : "  << (skin.market_info.vol_by_cap * 100.0f) << "%" << std::endl; // Assuming this is a percentage ratio
+    std::cout << "========================================\n" << std::endl;
+
+    std::cout << "--- FOUND " << skin.market_info.market_offers.size() << " OFFERS ---\n";
+
+    if(no_of_markets > skin.market_info.market_offers.size()) no_of_markets = skin.market_info.market_offers.size();
+    for(size_t i = 0; i < no_of_markets; i++)
+    {
+        const _MARKET_OFFERS& offer = skin.market_info.market_offers[i];
+
+        std::cout << " [" << (i + 1) << "] Market: " << std::left << std::setw(15) << offer.marketName
+                << "| Offers: " << std::left << std::setw(5) << offer.numOffers
+                << "| Price: $" << std::left << std::setw(10) << offer.minPrice
+                << "| Link: " << offer.marketLink << std::endl;
+    }
+}
+
+bool ScrapeSkin(ChromeClient& client, _SKINS& skin)
 {
     // ---------------------------------------------------------
     // Construct URL & Navigate
     // ---------------------------------------------------------
     std::string url = "https://csgoskins.gg/items/" + skin.name + "/" + skin.condition_string;
     
-    std::cout << "\n------------------------------------------------" << std::endl;
-    std::cout << "[+] Processing: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
-    std::cout << "[+] Navigating: " << url << std::endl;
+    // std::cout << "\n------------------------------------------------" << std::endl;
+    // std::cout << "[+] Processing: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
+    // std::cout << "[+] Navigating: " << url << std::endl;
 
-    Core::SendCommand("Page.navigate", { {"url", url} });
+    client.SendCommand("Page.navigate", { {"url", url} });
 
     // ---------------------------------------------------------
     // Wait for Load
     // ---------------------------------------------------------
 
-    if(!Core::WaitForSelector(".active-offer", 8000))
+    if(!client.WaitForSelector(".active-offer", 8000))
     {
         std::cerr << "[-] Timeout: Offers not found for " << skin.name << std::endl;
         return false;
@@ -431,7 +439,7 @@ bool ScrapeSkin(_SKINS& skin)
     // ---------------------------------------------------------
     // Extract Data
     // ---------------------------------------------------------
-    json response = inject_extractionJs();
+    json response = inject_extractionJs(client);
 
     // Helper Lambda for Float Parsing
     auto ParseCleanFloat = [](std::string raw) -> float {
@@ -485,98 +493,84 @@ bool ScrapeSkin(_SKINS& skin)
         }
     }
 
-    std::cout << "[+] Success: Scraped " << skin.market_info.market_offers.size() << " offers." << std::endl;
+    std::cout << "[+] Success: Scraped " << skin.market_info.market_offers.size() << " offers for " << skin.name << std::endl;
     return true;
 }
 
-void print(const _SKINS& skin)
+void RunWorker(_SKINS& skin, std::string proxy, int port)
 {
-    std::cout << "\n========================================" << std::endl;
-    std::cout << " ITEM: " << skin.name << " (" << skin.condition_string << ")" << std::endl;
-    std::cout << "========================================" << std::endl;
-    
-    // Print Global Stats with 2 decimal precision
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << " 24h Volume  : $" << skin.market_info.volume_24h << std::endl;
-    std::cout << " Vol / Cap   : "  << (skin.market_info.vol_by_cap * 100.0f) << "%" << std::endl; // Assuming this is a percentage ratio
-    std::cout << "========================================\n" << std::endl;
+    // GENERATE UNIQUE PORT & PROFILE
+    // int port = 10000 + (rand() % 5000); 
+    std::string tempProfile = "C:\\temp\\chrome_worker_" + std::to_string(port);
 
-    std::cout << "--- FOUND " << skin.market_info.market_offers.size() << " OFFERS ---\n";
-
-    for(const _MARKET_OFFERS& offer : skin.market_info.market_offers)
     {
-        std::cout << "Market: " << std::left << std::setw(15) << offer.marketName
-                  << "| Offers: " << std::left << std::setw(5) << offer.numOffers
-                  << "| Price: $" << std::left << std::setw(10) << offer.minPrice
-                  << "| Link: " << offer.marketLink << std::endl;
+        std::lock_guard<std::mutex> lock(printMutex);
+        std::cout << "\n[>>>] WORKER STARTED: " << skin.name << " on Port " << port;
     }
-    std::cout << std::endl;
+
+    // LAUNCH CHROME INSTANCE
+    PROCESS_INFORMATION pi = LaunchInstance(port, proxy, tempProfile);
+    if(pi.hProcess == NULL) return;
+
+    Sleep(1000);
+
+    // CONNECT WEB SOCKET
+    std::string wsUrl = GetWebSocketUrl(port);
+    
+    if(!wsUrl.empty())
+    {
+        ChromeClient client;
+        if(client.Connect(wsUrl))
+        {
+            // Verify IP inside this specific instance
+            client.SendCommand("Page.navigate", {{"url", "https://api.ipify.org"}});
+
+            if(client.WaitForSelector("pre", 30000))
+            {
+                json ipCheck = client.SendCommand("Runtime.evaluate", {
+                    {"expression", "document.body.innerText"},
+                    {"returnByValue", true}
+                });
+
+                if(ipCheck.contains("result") && ipCheck["result"].contains("result") && ipCheck["result"]["result"].contains("value"))
+                {
+
+                    std::string ip = ipCheck["result"]["result"]["value"];
+                    std::cout << "[*] Current IP: " << ip << std::endl;
+                } else std::cerr << "[-] Error: Failed to extract IP string." << std::endl;
+            } else std::cerr << "[-] Timeout: Tor network is too slow or connection died." << std::endl;
+
+
+            // PERFORM THE SCRAPE
+            if(!ScrapeSkin(client, skin)) std::cerr << "[-] Scrape failed for " << skin.name << std::endl;
+
+            client.Disconnect();
+        }
+    }
+    else std::cerr << "[-] Failed to connect to Worker on port " << port << std::endl;
+
+    // 5. CLEANUP
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    Sleep(1000); // Wait for file locks to release
+    try {
+        std::filesystem::remove_all(tempProfile); // Delete the temp user folder
+    } catch(...) {}
+
 }
 
 int main()
 {
-
-    #pragma region Initialize
-
     // Initialize Networking
     ix::initNetSystem();
+    srand(time(0));
 
-    std::cout << "[+] Launching Browser..." << std::endl;
-    std::string path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-    std::string torProxy = "socks5://127.0.0.1:9150";
-
-    if(!launch_chrome(path, torProxy))
-    {
-        ix::uninitNetSystem();
-        std::cerr << "[-] Failed to launch Chrome." << std::endl;
-        return 1;
-    }
-
-    Sleep(1000);
-
-    std::cout << "[+] Discovering CDP Endpoint..." << std::endl;
-    std::string wsUrl = GetWebSocketUrl();
-    if(wsUrl.empty())
-    {
-        ix::uninitNetSystem();
-        std::cerr << "[-] Could not find an active tab." << std::endl;
-        return 1;
-    } std::cout << "[+] Target Found: " << wsUrl << std::endl;
-    
-
-    // Connect the Bridge
-    Core::ConnectToBrowser(wsUrl);
-
-    #pragma endregion
-
-    // ----------------------------------------------------------------------------------------------------------------
-    
-    #pragma region Verify_tor_proxy
-    
-    std::cout << "[+] Checking IP Address via Tor..." << std::endl;
-    
-    Core::SendCommand("Page.navigate", { {"url", "https://api.ipify.org/"} });
-
-    if(Core::WaitForSelector("pre", 30000))
-    {
-        json ipCheck = Core::SendCommand("Runtime.evaluate", { 
-            {"expression", "document.body.innerText"}, 
-            {"returnByValue", true} 
-        });
-
-        if(ipCheck.contains("result") && ipCheck["result"].contains("result") && ipCheck["result"]["result"].contains("value"))
-        {
-            std::string ip = ipCheck["result"]["result"]["value"];
-            std::cout << "[*] Current IP: " << ip << std::endl;
-        }
-        else std::cerr << "[-] Error: Failed to extract IP string." << std::endl;
-    }
-    else std::cerr << "[-] Timeout: Tor network is too slow or connection died." << std::endl;
-
-    #pragma endregion
-
-    // ----------------------------------------------------------------------------------------------------------------
-
+    // ---------------------------------------------------------
+    // CONFIGURATION
+    // ---------------------------------------------------------
+    std::string currentProxy = "socks5://127.0.0.1:9150";
     std::vector<_SKINS> targets;
 
     _SKINS item1;
@@ -594,18 +588,39 @@ int main()
     item3.condition_string = "field-tested";
     targets.push_back(item3);
 
+    // ---------------------------------------------------------
+    // EXECUTION LOOP
+    // ---------------------------------------------------------
+    std::cout << "[+] Starting PARALLEL Batch of " << targets.size() << " items..." << std::endl;
     
-    std::cout << "\n[+] Starting Batch Scraping of " << targets.size() << " items..." << std::endl;
-    for(auto& skin : targets)
+    // A vector to hold our active threads
+    std::vector<std::thread> workerThreads;
+    int basePort = 10000;
+    
+    // Launch all workers simultaneously
+    for(int i = 0; i < targets.size(); i++)
     {
-
-        if(ScrapeSkin(skin)) print(skin);
-        else std::cerr << "[-] Failed to scrape " << skin.name << std::endl;
-
-        std::cout << "[...] Waiting 1 seconds..." << std::endl;
-        Sleep(1000); 
+        int assignedPort = basePort + i; // 10000, 10001, 10002...
+        workerThreads.emplace_back(RunWorker, std::ref(targets[i]), currentProxy, assignedPort);
+        
+        // Slight stagger
+        Sleep(200);
     }
-    
+
+    std::cout << "\n[+] All workers launched! Waiting for completion..." << std::endl;
+
+    // ---------------------------------------------------------
+    // SYNCHRONIZATION
+    // ---------------------------------------------------------
+
+    for(auto& t : workerThreads) if(t.joinable()) t.join();
+    std::cout << "[+] All Parallel Jobs Complete." << std::endl;
+
+    // ---------------------------------------------------------
+    // REPORTING
+    // ---------------------------------------------------------
+    std::cout << "\n=== FINAL REPORT ===" << std::endl;
+    for(const auto& skin : targets) print(skin, 2);
 
     ix::uninitNetSystem();
     return 0;
